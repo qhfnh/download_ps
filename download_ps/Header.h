@@ -80,22 +80,14 @@ typedef enum {
 } NaluType;
 
 
-
-//typedef struct
-//{
-//	unsigned char wight;
-//	unsigned char height;
-//	unsigned char len;
-//	bool is_key; //是否是关键真
-//}VIDEO_FRAME; //帧信息
-
-
 typedef struct
 {
 	const BYTE* data;   //sps数据
 	unsigned int size;          //sps数据大小
 	unsigned int index;         //当前计算位所在的位置标记
 } sps_bit_stream;
+
+
 
 typedef struct
 {
@@ -106,3 +98,13 @@ typedef struct
 	unsigned int height;
 	unsigned int fps;       //SPS中可能不包含FPS信息
 } sps_info_struct;
+
+typedef struct
+{
+	unsigned int len;
+	unsigned char buff_frame[1024*1024];
+	unsigned int stamp;
+	bool is_key; //是否是关键帧
+}VIDEO_FRAME; //帧信息
+
+

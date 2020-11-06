@@ -27,7 +27,7 @@ constexpr auto FM_VIDEO_ALG_H264 = 1;
 // 音频算法类型
 constexpr auto FM_AUDIO_ALG_G711A = 3;
 
-constexpr auto MAXBLOCKSIZE = 1024 * 10 +100 ;			//缓存大小
+constexpr auto MAXBLOCKSIZE = 1024 * 10 + 100 ;			//缓存大小
 #define EQUITPREFIX(arr_name,index) (arr_name[index] == 0 && arr_name[index + 1] == 0 && arr_name[index + 2] == 1)
 #define EQUIT00(arr_name,index) (arr_name[index] == 0 && arr_name[index + 1] == 0 && arr_name[index + 2] == 0)
 #define EQUITBIT(arr_name,index,t) arr_name[index] == 0 && arr_name[index + 1] == 0 && arr_name[index + 2] == 1 && arr_name[index + 3] == t
@@ -45,6 +45,8 @@ constexpr auto MAXBLOCKSIZE = 1024 * 10 +100 ;			//缓存大小
 
 
 bool g_is_video = true;
+VIDEO_FRAME video_frame;
+sps_info_struct sps;
 void saveH264(const char* data , int len ,bool is_add) 
 {
 	if (!g_is_video)
@@ -565,20 +567,11 @@ Header parase_h264(int len)
 		}
 		case NALU_TYPE_SPS:
 		{
-			sps_info_struct sps;
+	
 			h264_parse_sps(arr_name + index - 1, len1 - index + 1, &sps);
-			//int profile_ide = arr_name[index ++];
-			//int constraint_set0_flag = (arr_name[index]  & 0x80) >> 7;
-			//int constraint_set1_flag = (arr_name[index] & 0x40) >> 6;
-			//int constraint_set2_flag = (arr_name[index] & 0x20) >> 5;
-			//int constraint_set3_flag = (arr_name[index] & 0x10) >> 4;
-			//int constraint_set4_flag = (arr_name[index] & 0x08) >> 3;
-			//int constraint_set5_flag = (arr_name[index] & 0x04) >> 2;
-			//int reserved_zero_2bit	=  arr_name[index] & 0x03;
-			//int level_idc = arr_name[++index];
 
 
-			break;
+			break;	
 		}
 		case NALU_TYPE_PPS:
 		{
@@ -674,6 +667,8 @@ Header parase_pes(unsigned char* arr_name, int& index, int len ,unsigned int& re
 			index += 5;
 			std::cout<< "index:" << index << ":0xc0:";
 
+			unsigned long long pts = (PTS32_30 << 30) + (PTS29_15 << 15) + PTS14_0;
+			video_frame.stamp = pts / 90;
 		}
 		else 
 		{
@@ -692,6 +687,13 @@ Header parase_pes(unsigned char* arr_name, int& index, int len ,unsigned int& re
 		}
 		else if (packet_end >= len || index == len) //解析数据  数据时不够
 		{
+			if (g_is_video) //只添加视频 包含ps包中的所用pes（oxe0）
+			{
+				memcpy(video_frame.buff_frame + video_frame.len, arr_name + index, len - index);
+				video_frame.len += len - index;
+			}
+
+
 			std::cout << "::index:" << index << ":index == len" << std::endl;
 			remain_len = 0;
 			reserve = packet_end - len;
@@ -701,8 +703,14 @@ Header parase_pes(unsigned char* arr_name, int& index, int len ,unsigned int& re
 		}
 		else //正常解析
 		{
-			remain_len = 0;
+			if (g_is_video) ////只添加视频
+			{
+				memcpy(video_frame.buff_frame + video_frame.len, arr_name + index, PES_packet_length - PES_header_data_length - 3);
+				video_frame.len += PES_packet_length - PES_header_data_length - 3;
+			}
 
+
+			remain_len = 0;
 			saveH264(reinterpret_cast<const char*>(arr_name + index), PES_packet_length - PES_header_data_length - 3, false);
 			parase_h264(PES_packet_length - PES_header_data_length - 3);
 			index = packet_end;
@@ -725,12 +733,24 @@ Header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 	int index = 0;//当前文件索引
 	if (reserve >= len) //处理数据中断
 	{
+		if (g_is_video) 
+		{
+			memcpy(video_frame.buff_frame + video_frame.len, arr_name + index, len);
+			video_frame.len += len;
+		}
+
 		saveH264(reinterpret_cast<const char*>(arr_name + index), len, true);
 		reserve -= len;
 		return ps_data_loading;
 	}
 	else if (reserve > 0 && reserve < len)
 	{
+		if (g_is_video)
+		{
+			memcpy(video_frame.buff_frame + video_frame.len, arr_name + index, reserve);
+			video_frame.len += reserve;
+		}
+
 		saveH264(reinterpret_cast<const char*>(arr_name + index), reserve, true);
 		index += reserve;
 		reserve = 0;
@@ -743,6 +763,28 @@ Header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 		{
 		case 0xba:  // ps
 		{
+			
+			if (video_frame.len > 0) 
+			{
+				char buff[1024 * 600] = {0};
+				int len1 = FM_MakeVideoFrame(video_frame.stamp, sps.width, sps.height, FM_VIDEO_ALG_H264, video_frame.is_key, (char *)video_frame.buff_frame, video_frame.len, buff, 1024 * 600);
+
+				ofstream fd1("add.h264", ios::out | ios::binary | ios::app);
+				unsigned int frametype = 1;
+				if (fd1.is_open())
+				{
+					fd1.write((char *)&frametype,sizeof frametype);
+					fd1.write((char *)&len1, sizeof len1);
+					fd1.write(buff, len1);
+					fd1.close();
+				}
+			}
+
+			video_frame.is_key = false;
+			video_frame.len = 0;
+			video_frame.stamp = 0;
+			memset(video_frame.buff_frame, 0, 1024 * 1024);
+
 			int start_index = index;
 			int stuff_byte = arr_name[index + 13] & 0x07;
 			index += stuff_byte + 14;
@@ -763,6 +805,8 @@ Header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 		}
 		case 0xbb: //sys
 		{
+			video_frame.is_key = true;
+
 			int start_index = index;
 			int sys_header_length = SUMLEN(arr_name, index + 4);
 			index = index + 6 + sys_header_length;
@@ -879,10 +923,20 @@ Header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 
 void download(const char* Url, const char* save_as)	/*将Url指向的地址的文件bai下载到save_as指向的本地文件*/
 {
+
+	video_frame.len = 0;
+	video_frame.stamp = 0;
+	video_frame.is_key = false;
+	memset(video_frame.buff_frame, 0, 1024 * 1024);
+	sps.fps = 0;
+	sps.height = 0;
+	sps.width = 0;
+	sps.profile_idc = 0;
+	sps.level_idc = 0;
+
 	byte Temp[MAXBLOCKSIZE];
 	//byte save_data[100];
 	memset(Temp,0, MAXBLOCKSIZE);
-	//memset(save_data, 0, 100);
 	ULONG Number = 1;
 	int remain = 0;
 	FILE* stream;
@@ -901,7 +955,7 @@ void download(const char* Url, const char* save_as)	/*将Url指向的地址的�
 					memset(Temp + remain, 0, MAXBLOCKSIZE - remain);
 					InternetReadFile(handle2, Temp + remain, MAXBLOCKSIZE - 100, &Number);
 					Number += remain;
-					Header sta=ps_parase(Temp,Number,remain);
+					Header sta= ps_parase(Temp,Number,remain);
 					if (sta == ps_packet_head_loading)
 					{
 						//基本上不可能不满足
