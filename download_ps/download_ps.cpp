@@ -13,11 +13,13 @@
 #include <iostream>
 #include <sstream>
 #include <fstream>
+#include<thread>
+#include<mutex>
 #include <cstring>
 #include <time.h>
 #include "PsPacket.h"
 #include "Header.h"
- 
+#include <queue>
 
 //// ffmpeg
 extern "C" 
@@ -42,6 +44,9 @@ extern "C"
 #pragma comment (lib, "swscale.lib")
 
 constexpr auto MAXBLOCKSIZE = 1024 * 10 + 100 ;			//缓存大小
+
+#define IO_BUFFER_SIZE 1024 * 32
+
 #define EQUITPREFIX(arr_name,index) (arr_name[index] == 0 && arr_name[index + 1] == 0 && arr_name[index + 2] == 1)
 #define EQUIT00(arr_name,index) (arr_name[index] == 0 && arr_name[index + 1] == 0 && arr_name[index + 2] == 0)
 #define EQUITBIT(arr_name,index,t) arr_name[index] == 0 && arr_name[index + 1] == 0 && arr_name[index + 2] == 1 && arr_name[index + 3] == t
@@ -52,25 +57,68 @@ VIDEO_FRAME video_frame;
 sps_info_struct sps;
 
 
-FILE* fp_open;
+//FILE* fp_open;
 
-#define IO_BUFFER_SIZE 32768
+mutex m;
+queue <int> products;
+condition_variable cond;
+bool notify = false;
+
+
+
 
 
 int fill_iobuffer(void* opaque, uint8_t* buf, int buf_size)
 {
-	if (!feof(fp_open)) {
-		int true_size = fread(buf, 1, buf_size, fp_open);
-		return true_size;
+	//if (!feof(fp_open)) {
+	//	int true_size = fread(buf, 1, buf_size, fp_open);
+	//	return true_size;
+	//}
+	//else {
+	//	return -1;
+	//}
+		static int  sum = 0;
+		//上锁保护共享资源,unique_lock一次实现上锁和解锁
+		unique_lock<mutex>lk(m);
+		//等待生产者者通知有资源
+		while (!notify) {
+
+			cond.wait(lk);
+		}
+
+		//要是队列不为空的话
+		if (!products.empty()) {
+
+			if (sum + buf_size <= video_frame.len)
+			{
+				memcpy_s(buf, buf_size, video_frame.buff_frame + sum, buf_size);
+				sum += buf_size;
+				return buf_size;
+			}
+			else if (sum <= video_frame.len)
+			{
+				
+				int len1 = video_frame.len - sum;
+				memcpy_s(buf, buf_size, video_frame.buff_frame + sum, len1);
+				sum = 0;
+				products.pop();
+				//通知生产者仓库容量不足,生产产品
+				notify = false;
+				cond.notify_one();
+				return len1;
+			}
+			else
+			{
+				std::cout << "buf_size:" << buf_size << "  video_frame.len:" << video_frame.len << std::endl;
+				system("pause");
+				return -1;
+			}
+
+		}
 	}
-	else {
-		return -1;
-	}
-
-}
 
 
-int pushStream(const char* in_filename_v, const char* url ,const unsigned char* data = NULL, int len = 0)
+int pushStream( const char* url ,const unsigned char* data = NULL, int len = 0)
 {
 
 	AVInputFormat* ifmt_v = NULL;
@@ -83,16 +131,16 @@ int pushStream(const char* in_filename_v, const char* url ,const unsigned char* 
 	int64_t cur_pts_v = 0;
 	AVStream* out_stream = NULL;
 	AVStream* in_stream = NULL;
-	fp_open = fopen(in_filename_v, "rb+");
+	//fp_open = fopen(in_filename_v, "rb+");
 
 	ifmt_ctx_v = avformat_alloc_context();
 
 
 	unsigned char* iobuffer = (unsigned char*)av_malloc(IO_BUFFER_SIZE);
 	AVIOContext* avio = avio_alloc_context(iobuffer, IO_BUFFER_SIZE, 0, NULL, fill_iobuffer, NULL, NULL);
-
-	//ifmt_v = av_find_input_format("h264");
-	if ((ret = avformat_open_input(&ifmt_ctx_v, in_filename_v, NULL, NULL)) < 0) {
+	ifmt_ctx_v->pb = avio;
+	ifmt_v = av_find_input_format("h264");
+	if ((ret = avformat_open_input(&ifmt_ctx_v, NULL, ifmt_v, NULL)) < 0) {
 		printf("Could not open input file.");
 		goto end;
 	}
@@ -103,7 +151,7 @@ int pushStream(const char* in_filename_v, const char* url ,const unsigned char* 
 	}
 
 	printf("===========Input Information==========\n");
-	av_dump_format(ifmt_ctx_v, 0, in_filename_v, 0);
+	//av_dump_format(ifmt_ctx_v, 0, in_filename_v, 0);
 	printf("======================================\n");
 	avformat_alloc_output_context2(&ofmt_ctx, NULL, "rtsp", url);
 	if (!ofmt_ctx) {
@@ -216,7 +264,7 @@ end:
 	if (ofmt_ctx && !(ofmt->flags & AVFMT_NOFILE))
 		avio_close(ofmt_ctx->pb);
 	avformat_free_context(ofmt_ctx);
-	fclose(fp_open);
+	//fclose(fp_open);
 	if (ret < 0 && ret != AVERROR_EOF) 
 {
 		printf("Error occurred.\n");
@@ -521,18 +569,30 @@ Header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 			
 			if (video_frame.len > 0) 
 			{
-				//pushStream(video_frame.buff_frame, video_frame.len,"rtsp://localhost:554/tes");
+				
+				{
+					unique_lock<mutex>lk(m);
+					products.push(1);
+					notify = true;
+					cond.notify_one();
+					while (notify || !products.empty()) {
+
+						cond.wait(lk);
+					}					
+					
+					
+				}
+				//pushStream("rtsp://localhost:554/tes",video_frame.buff_frame, video_frame.len);
 				char buff[1024 * 600] = {0};
 				int len1 = FM_MakeVideoFrame(video_frame.stamp, sps.width, sps.height, FM_VIDEO_ALG_H264, video_frame.is_key, (char *)video_frame.buff_frame, video_frame.len, buff, 1024 * 600);
-
 				ofstream fd1("add1.h264", ios::out | ios::binary | ios::app);
 				unsigned int frametype = 1;
 				if (fd1.is_open())
 				{
-					fd1.write((char*)video_frame.buff_frame, video_frame.len);
-					//fd1.write((char *)&frametype,sizeof frametype);
-					//fd1.write((char *)&len1, sizeof len1);
-					//fd1.write(buff, len1);
+					//fd1.write((char*)video_frame.buff_frame, video_frame.len);
+					fd1.write((char *)&frametype,sizeof frametype);
+					fd1.write((char *)&len1, sizeof len1);
+					fd1.write(buff, len1);
 					fd1.close();
 				}
 			}
@@ -746,13 +806,12 @@ void download(const char* Url, const char* save_as)	/*将Url指向的地址的�
 	}
 }
 
-
-
-
 int main(int argc, char* argv[]) {
 	//http://172.22.72.1:9580/test.ps
-
-	//download("http://172.22.172.1:9580/876221_13660360807_3ZWCA333447FELB.ps", "c:/q.ps");/*调用示例，下载百度的首页到c:\index.html文件*/
-	pushStream("add1.h264","rtsp://localhost:554/t");
+	thread t1(pushStream , "rtsp://localhost:554/tes", video_frame.buff_frame, video_frame.len);
+	download("http://172.22.172.1:9580/876221_13660360807_3ZWCA333447FELB.ps", "c:/q.ps");/*调用示例，下载百度的首页到c:\index.html文件*/
+	//pushStream("add1.h264","rtsp://localhost:554/t");
+	t1.join();
+	
 	return 0;
 }
