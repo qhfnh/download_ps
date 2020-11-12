@@ -2,3 +2,7 @@
 // such as names of functions and macros.
 // For more information see https://go.microsoft.com/fwlink/?linkid=865984
 #define EQUITPREFIX(name, index) name[index] == 0 && name[index + 1] == 0 && name[index + 2] == 1
+#define EXTERN_C_END }
+#define EXTERN_C_END
+#define EXTERN_C_START extern "C" {
+#define EXTERN_C_START

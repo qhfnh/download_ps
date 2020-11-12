@@ -1,31 +1,45 @@
-﻿#include <windows.h>
-#include <wininet.h>
-#include <atlconv.h>
+﻿//windows
+#ifdef WIN32
 
+#include <windows.h>
+#include <wininet.h>
+#include <tchar.h>
+#include <atlbase.h>
+#pragma comment( lib, "wininet.lib" )
+
+#endif // WIN32
+
+#include <atlconv.h>
 #include <iostream>
 #include <sstream>
 #include <fstream>
 #include <cstring>
-#include <tchar.h>
-#include "PsPacket.h"
-#include <atlbase.h>
 #include <time.h>
+#include "PsPacket.h"
 #include "Header.h"
-#pragma comment( lib, "wininet.lib" )
+ 
 
-// 帧类型定义
-constexpr auto FM_FRAME_TYPE_VIDEO = 1;
-constexpr auto FM_FRAME_TYPE_AUDIO = 2;
+//// ffmpeg
+extern "C" 
+{
+	#include <libavcodec/avcodec.h>
+	#include <libavformat/avformat.h>
+	#include <libswscale/swscale.h>
+	#include <libavutil/pixfmt.h>
+	#include <libavutil/imgutils.h>
+	#include <libavutil/parseutils.h>
+	#include <libavutil/opt.h>
+	#include <libswscale/swscale.h>
+	#include <libavutil/time.h>
 
-constexpr auto FM_ERROR_OK = 0;				// 成功;
-constexpr auto FM_ERROR_UNKWON = -1;					// 失败;
-constexpr auto FM_ERROR_MEM_OVERLOAD = -2;				// 内存出错;
-
-// 视频算法类型
-constexpr auto FM_VIDEO_ALG_H264 = 1;
-
-// 音频算法类型
-constexpr auto FM_AUDIO_ALG_G711A = 3;
+};
+#pragma comment (lib, "avcodec.lib")
+#pragma comment (lib, "avdevice.lib")
+#pragma comment (lib, "avfilter.lib")
+#pragma comment (lib, "avformat.lib")
+#pragma comment (lib, "avutil.lib")
+#pragma comment (lib, "swresample.lib")
+#pragma comment (lib, "swscale.lib")
 
 constexpr auto MAXBLOCKSIZE = 1024 * 10 + 100 ;			//缓存大小
 #define EQUITPREFIX(arr_name,index) (arr_name[index] == 0 && arr_name[index + 1] == 0 && arr_name[index + 2] == 1)
@@ -33,8 +47,186 @@ constexpr auto MAXBLOCKSIZE = 1024 * 10 + 100 ;			//缓存大小
 #define EQUITBIT(arr_name,index,t) arr_name[index] == 0 && arr_name[index + 1] == 0 && arr_name[index + 2] == 1 && arr_name[index + 3] == t
 #define SUMLEN(arr_name,index)  arr_name[index] << 8 | arr_name[index + 1]
 //#define GETBIT(arr_name,index,start,len) (arr_name[index] & (1 <<)) >> start
+bool g_is_video = true;
+VIDEO_FRAME video_frame;
+sps_info_struct sps;
 
- 
+
+FILE* fp_open;
+
+#define IO_BUFFER_SIZE 32768
+
+
+int fill_iobuffer(void* opaque, uint8_t* buf, int buf_size)
+{
+	if (!feof(fp_open)) {
+		int true_size = fread(buf, 1, buf_size, fp_open);
+		return true_size;
+	}
+	else {
+		return -1;
+	}
+
+}
+
+
+int pushStream(const char* in_filename_v, const char* url ,const unsigned char* data = NULL, int len = 0)
+{
+
+	AVInputFormat* ifmt_v = NULL;
+	AVOutputFormat* ofmt = NULL;
+	AVFormatContext* ifmt_ctx_v = NULL, * ofmt_ctx = NULL;
+	AVPacket pkt;
+	int ret, i;
+	int videoindex_v = -1, videoindex_out = -1;
+	int frame_index = 0;
+	int64_t cur_pts_v = 0;
+	AVStream* out_stream = NULL;
+	AVStream* in_stream = NULL;
+	fp_open = fopen(in_filename_v, "rb+");
+
+	ifmt_ctx_v = avformat_alloc_context();
+
+
+	unsigned char* iobuffer = (unsigned char*)av_malloc(IO_BUFFER_SIZE);
+	AVIOContext* avio = avio_alloc_context(iobuffer, IO_BUFFER_SIZE, 0, NULL, fill_iobuffer, NULL, NULL);
+
+	//ifmt_v = av_find_input_format("h264");
+	if ((ret = avformat_open_input(&ifmt_ctx_v, in_filename_v, NULL, NULL)) < 0) {
+		printf("Could not open input file.");
+		goto end;
+	}
+
+	if ((ret = avformat_find_stream_info(ifmt_ctx_v, 0)) < 0) {
+		printf("Failed to retrieve input stream information");
+		goto end;
+	}
+
+	printf("===========Input Information==========\n");
+	av_dump_format(ifmt_ctx_v, 0, in_filename_v, 0);
+	printf("======================================\n");
+	avformat_alloc_output_context2(&ofmt_ctx, NULL, "rtsp", url);
+	if (!ofmt_ctx) {
+		printf("Could not create output context\n");
+		ret = AVERROR_UNKNOWN;
+		goto end;
+	}
+	av_opt_set(ofmt_ctx->priv_data, "rtsp_transport", "tcp", 0);
+
+	ofmt = ofmt_ctx->oformat;
+	in_stream = ifmt_ctx_v->streams[0];
+
+	out_stream = avformat_new_stream(ofmt_ctx, NULL);
+	videoindex_v = 0;
+	if (!out_stream) {
+		printf("Failed allocating output stream\n");
+		ret = AVERROR_UNKNOWN;
+		goto end;
+	}
+	videoindex_out = out_stream->index;
+	//Copy the settings of AVCodecContext
+	if (avcodec_copy_context(out_stream->codec, in_stream->codec) < 0) {
+		printf("Failed to copy context from input to output stream codec context\n");
+		goto end;
+	}
+	out_stream->codec->codec_tag = 0;
+	/* Some formats want stream headers to be separate. */
+	if (ofmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
+		out_stream->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+		std::cout << "ppppp" << std::endl;
+
+	printf("==========Output Information==========\n");
+	av_dump_format(ofmt_ctx, 0, url, 1);
+	printf("======================================\n");
+	//Open output file
+	if (!(ofmt->flags & AVFMT_NOFILE)) {
+		if (avio_open(&ofmt_ctx->pb, url , AVIO_FLAG_WRITE) < 0) {
+			printf("Could not open output file '%s'", url);
+			goto end;
+		}
+	}
+
+
+	if (avformat_write_header(ofmt_ctx, NULL) < 0) {
+		printf("Error occurred when opening output file\n");
+		goto end;
+	}
+	while (1) {
+		AVFormatContext* ifmt_ctx;
+		int stream_index = 0;
+		//AVStream* in_stream, * out_stream;
+
+		//Get an AVPacket
+		ifmt_ctx = ifmt_ctx_v;
+		stream_index = videoindex_out;
+
+		if (av_read_frame(ifmt_ctx, &pkt) >= 0) {
+			do {
+				in_stream = ifmt_ctx->streams[pkt.stream_index];
+				out_stream = ofmt_ctx->streams[stream_index];
+
+				if (pkt.stream_index == videoindex_v) {
+					//FIX：No PTS (Example: Raw H.264)
+					//Simple Write PTS
+					if (pkt.pts == AV_NOPTS_VALUE) {
+						//Write PTS
+						AVRational time_base1 = in_stream->time_base;
+						//Duration between 2 frames (μs)
+						int64_t calc_duration = (double)AV_TIME_BASE / av_q2d(in_stream->r_frame_rate);
+						//Parameters
+						pkt.pts = (double)(frame_index * calc_duration) / (double)(av_q2d(time_base1) * AV_TIME_BASE);
+						pkt.dts = pkt.pts;
+						pkt.duration = (double)calc_duration / (double)(av_q2d(time_base1) * AV_TIME_BASE);
+						frame_index++;
+					}
+					cur_pts_v = pkt.pts;
+					break;
+				}
+			} while (av_read_frame(ifmt_ctx, &pkt) >= 0);
+		}
+		else 
+		{
+			break;
+		}
+
+		//Convert PTS/DTS
+		pkt.pts = av_rescale_q_rnd(pkt.pts, in_stream->time_base, out_stream->time_base, (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+		pkt.dts = av_rescale_q_rnd(pkt.dts, in_stream->time_base, out_stream->time_base, (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+		pkt.duration = av_rescale_q(pkt.duration, in_stream->time_base, out_stream->time_base);
+		pkt.pos = -1;
+		pkt.stream_index = stream_index;
+
+		av_usleep(pkt.duration);
+		printf("Write 1 Packet. size:%5d\tpts:%lld\n", pkt.size, pkt.pts);
+		//Write
+		if (av_interleaved_write_frame(ofmt_ctx, &pkt) < 0) {
+			printf("Error muxing packet\n");
+			break;
+		}
+		av_free_packet(&pkt);
+
+	}
+
+
+	//Write file trailer
+	av_write_trailer(ofmt_ctx);
+end:
+	avformat_close_input(&ifmt_ctx_v);
+	/* close output */
+	if (ofmt_ctx && !(ofmt->flags & AVFMT_NOFILE))
+		avio_close(ofmt_ctx->pb);
+	avformat_free_context(ofmt_ctx);
+	fclose(fp_open);
+	if (ret < 0 && ret != AVERROR_EOF) 
+{
+		printf("Error occurred.\n");
+		return -1;
+	}
+	//return 0;
+	//avformat_network_init();//需要反初始化 avformat_network_deinit(void);
+	
+	return 0;
+}
 /**
 * arr_name  为数组的名字
 * index 或index_xxx 总是要解析的位置，并且是arr_name的绝对位置
@@ -44,10 +236,8 @@ constexpr auto MAXBLOCKSIZE = 1024 * 10 + 100 ;			//缓存大小
 
 
 
-bool g_is_video = true;
-VIDEO_FRAME video_frame;
-sps_info_struct sps;
-void saveH264(const char* data , int len ,bool is_add) 
+
+void saveH264(const char* data, int len, bool is_add)
 {
 	if (!g_is_video)
 	{
@@ -77,434 +267,6 @@ void saveH264(const char* data , int len ,bool is_add)
 		fd_frame.close();
 	}
 
-}
-
-
-int FM_MakeVideoFrame(unsigned int ts, int width, int height, int alg, int key_flag, char* data, int dataLen, char* buf, int bufLen)
-{
-	int videoDataLen = sizeof(X2Q_STORAGE_HEAD) + sizeof(X2Q_VIDEO_HEAD) + sizeof(X2Q_VIDEO_ALG_HEAD) + dataLen;
-	if (videoDataLen > bufLen)   // buf空间不够大
-	{
-		return FM_ERROR_MEM_OVERLOAD;
-	}
-
-	memset(buf, 0, bufLen);  // 将buf置0
-
-	videoDataLen = 0;    // buf指针的偏移量
-
-	X2Q_STORAGE_HEAD* pStorageHead = (X2Q_STORAGE_HEAD*)buf; // 数据包头
-	pStorageHead->utc = time(NULL);
-	pStorageHead->timestamp = ts;
-	pStorageHead->key_flag = key_flag;
-
-	videoDataLen += sizeof(X2Q_STORAGE_HEAD);
-
-	X2Q_VIDEO_HEAD* pVideoHead = (X2Q_VIDEO_HEAD*)(buf + videoDataLen);   // 视频头
-	pVideoHead->frm_rate = 25;
-	pVideoHead->width = width;
-	pVideoHead->height = height;
-	pVideoHead->producer_id = 1;
-
-	videoDataLen += sizeof(X2Q_VIDEO_HEAD);
-
-	X2Q_VIDEO_ALG_HEAD* pVideoAlgHead = (X2Q_VIDEO_ALG_HEAD*)(buf + videoDataLen);  // 视屏算法头
-	pVideoAlgHead->alg = alg;           // 只填算法类型，其它数据置0
-	pVideoAlgHead->ctl_flag = 0;
-
-	videoDataLen += sizeof(X2Q_VIDEO_ALG_HEAD);
-
-	memcpy(buf + videoDataLen, data, dataLen);
-
-	return videoDataLen + dataLen;
-}
-
-
-int FM_MakeAudioFrame(unsigned int ts, int alg, char* data, int dataLen, FM_AUDIO_INFO* info, char* buf, int bufLen)
-{
-	memset(buf, 0, bufLen); // 把buf所有字节置0
-	if ((sizeof(X2Q_STORAGE_HEAD) + sizeof(X2Q_AUDIO_HEAD)) > bufLen)   // buf空间不够大
-	{
-		return FM_ERROR_MEM_OVERLOAD;
-	}
-	int offset = 0;
-
-	X2Q_STORAGE_HEAD* pStorageHead = (X2Q_STORAGE_HEAD*)(buf + offset);                                            // 数据包头
-	pStorageHead->utc = time(NULL);
-	pStorageHead->timestamp = ts;
-	pStorageHead->key_flag = 1;
-
-	offset += sizeof(X2Q_STORAGE_HEAD);
-
-	X2Q_AUDIO_HEAD* pAudioHead = (X2Q_AUDIO_HEAD*)(buf + offset);
-	pAudioHead->bits = info->bits;
-	pAudioHead->channel = info->channel;
-	pAudioHead->simple = info->simple / 100.0;
-	pAudioHead->energy = 10;
-	pAudioHead->producer_id = 1;
-	switch (alg)
-	{
-	case FM_AUDIO_ALG_G711A:
-		// 确定算法类型后判断传入的data长度是否合法
-		if (dataLen < 0 || dataLen % (6 * 80) != 0)
-		{
-			return FM_ERROR_UNKWON;
-		}
-
-		pAudioHead->block_align = 4 + 4 + 6 * 80;
-		pAudioHead->frm_num = dataLen / (6 * 80);
-		pAudioHead->pcm_len = 6 * 160;
-		break;
-	default:
-		return FM_ERROR_UNKWON;
-	}
-	offset += sizeof(X2Q_AUDIO_HEAD);
-
-	// 判断buf空间是否足够
-	if ((offset + pAudioHead->frm_num * pAudioHead->block_align) > bufLen)
-	{
-		// 传入的buf长度不足以执行内存拷贝
-		return FM_ERROR_MEM_OVERLOAD;
-	}
-
-	// 多个音频包，添加到buf里面
-	for (int i = 0; i < pAudioHead->frm_num; i++)
-	{
-		char* writePos = buf + offset;
-		// 音频算法头
-		X2Q_AUDIO_ALG_HEAD* pAudioAlgHead = (X2Q_AUDIO_ALG_HEAD*)(writePos);
-		pAudioAlgHead->alg = alg;
-
-		writePos += sizeof(X2Q_AUDIO_ALG_HEAD);
-
-		switch (alg)
-		{
-		case FM_AUDIO_ALG_G711A:
-		{
-			// 添加海思帧头
-			writePos[0] = 0x0;
-			writePos[1] = 0x1;
-			*((unsigned short*)&writePos[2]) = 480 / 2;
-			writePos += 4;
-
-			// 写音频数据
-			char* dataPos = data + i * 480;
-			memcpy(writePos, dataPos, 480);
-		}
-		break;
-		default:
-			return FM_ERROR_UNKWON;
-		}
-		offset += pAudioHead->block_align;
-	}
-	return  offset;
-}
-
-
-
-static void del_emulation_prevention(BYTE* data, UINT* dataSize)
-{
-	UINT dataSizeTemp = *dataSize;
-	for (UINT i = 0, j = 0; i < (dataSizeTemp - 2); i++) {
-		int val = (data[i] ^ 0x0) + (data[i + 1] ^ 0x0) + (data[i + 2] ^ 0x3);    //检测是否是竞争码
-		if (val == 0) {
-			for (j = i + 2; j < dataSizeTemp - 1; j++) {    //移除竞争码
-				data[j] = data[j + 1];
-			}
-
-			(*dataSize)--;      //data size 减1
-		}
-	}
-}
-
-static void sps_bs_init(sps_bit_stream* bs, const BYTE* data, UINT size)
-{
-	if (bs) {
-		bs->data = data;
-		bs->size = size;
-		bs->index = 0;
-	}
-}
-
-
-/**
- 是否已经到数据流最后
-
- @param bs sps_bit_stream数据
- @return 1：yes，0：no
- */
-
-static INT eof(sps_bit_stream* bs)
-{
-	return (bs->index >= bs->size * 8);    //位偏移已经超出数据
-}
-
-/**
- 读取从起始位开始的BitCount个位所表示的值
-
- @param bs sps_bit_stream数据
- @param bitCount bit位个数(从低到高)
- @return value
- */
-static UINT u(sps_bit_stream* bs, BYTE bitCount)
-{
-	UINT val = 0;
-	for (BYTE i = 0; i < bitCount; i++) {
-		val <<= 1;
-		if (eof(bs)) {
-			val = 0;
-			break;
-		}
-		else if (bs->data[bs->index / 8] & (0x80 >> (bs->index % 8))) {     //计算index所在的位是否为1
-			val |= 1;
-		}
-		bs->index++;
-	}
-
-	return val;
-}
-
-
-/**
- 读取无符号哥伦布编码值(UE)
- #2^LeadingZeroBits - 1 + (xxx)
- @param bs sps_bit_stream数据
- @return value
- */
-static UINT ue(sps_bit_stream* bs)
-{
-	UINT zeroNum = 0;
-	while (u(bs, 1) == 0 && !eof(bs) && zeroNum < 32) {
-		zeroNum++;
-	}
-
-	return (UINT)((1 << zeroNum) - 1 + u(bs, zeroNum));
-}
-
-
-/**
- 读取有符号哥伦布编码值(SE)
- #(-1)^(k+1) * Ceil(k/2)
-
- @param bs sps_bit_stream数据
- @return value
- */
-static INT se(sps_bit_stream* bs)
-{
-	INT ueVal = (INT)ue(bs);
-	double k = ueVal;
-
-	INT seVal = (INT)ceil(k / 2);     //ceil:返回大于或者等于指定表达式的最小整数
-	if (ueVal % 2 == 0) {       //偶数取反，即(-1)^(k+1)
-		seVal = -seVal;
-	}
-
-	return seVal;
-}
-
-
-/**
- 视频可用性信息(Video usability information)解析
- @param bs sps_bit_stream数据
- @param info sps解析之后的信息数据及结构体
- @see E.1.1 VUI parameters syntax
- */
-void vui_para_parse(sps_bit_stream* bs, sps_info_struct* info)
-{
-	UINT aspect_ratio_info_present_flag = u(bs, 1);
-	if (aspect_ratio_info_present_flag) {
-		UINT aspect_ratio_idc = u(bs, 8);
-		if (aspect_ratio_idc == 255) {      //Extended_SAR
-			u(bs, 16);      //sar_width
-			u(bs, 16);      //sar_height
-		}
-	}
-
-	UINT overscan_info_present_flag = u(bs, 1);
-	if (overscan_info_present_flag) {
-		u(bs, 1);       //overscan_appropriate_flag
-	}
-
-	UINT video_signal_type_present_flag = u(bs, 1);
-	if (video_signal_type_present_flag) {
-		u(bs, 3);       //video_format
-		u(bs, 1);       //video_full_range_flag
-		UINT colour_description_present_flag = u(bs, 1);
-		if (colour_description_present_flag) {
-			u(bs, 8);       //colour_primaries
-			u(bs, 8);       //transfer_characteristics
-			u(bs, 8);       //matrix_coefficients
-		}
-	}
-
-	UINT chroma_loc_info_present_flag = u(bs, 1);
-	if (chroma_loc_info_present_flag) {
-		ue(bs);     //chroma_sample_loc_type_top_field
-		ue(bs);     //chroma_sample_loc_type_bottom_field
-	}
-
-	UINT timing_info_present_flag = u(bs, 1);
-	if (timing_info_present_flag) {
-		UINT num_units_in_tick = u(bs, 32);
-		UINT time_scale = u(bs, 32);
-		UINT fixed_frame_rate_flag = u(bs, 1);
-
-		info->fps = (UINT)((float)time_scale / (float)num_units_in_tick);
-		if (fixed_frame_rate_flag) {
-			info->fps = info->fps / 2;
-		}
-	}
-
-	UINT nal_hrd_parameters_present_flag = u(bs, 1);
-	if (nal_hrd_parameters_present_flag) {
-		//hrd_parameters()  //see E.1.2 HRD parameters syntax
-	}
-
-	//后面代码需要hrd_parameters()函数接口实现才有用
-	UINT vcl_hrd_parameters_present_flag = u(bs, 1);
-	if (vcl_hrd_parameters_present_flag) {
-		//hrd_parameters()
-	}
-	if (nal_hrd_parameters_present_flag || vcl_hrd_parameters_present_flag) {
-		u(bs, 1);   //low_delay_hrd_flag
-	}
-
-	u(bs, 1);       //pic_struct_present_flag
-	UINT bitstream_restriction_flag = u(bs, 1);
-	if (bitstream_restriction_flag) {
-		u(bs, 1);   //motion_vectors_over_pic_boundaries_flag
-		ue(bs);     //max_bytes_per_pic_denom
-		ue(bs);     //max_bits_per_mb_denom
-		ue(bs);     //log2_max_mv_length_horizontal
-		ue(bs);     //log2_max_mv_length_vertical
-		ue(bs);     //max_num_reorder_frames
-		ue(bs);     //max_dec_frame_buffering
-	}
-}
-
-
-INT h264_parse_sps(const BYTE* data, UINT dataSize, sps_info_struct* info)
-{
-	if (!data || dataSize <= 0 || !info) return 0;
-	INT ret = 0;
-
-	BYTE* dataBuf = (BYTE*)malloc(dataSize);
-	memcpy(dataBuf, data, dataSize);        //重新拷贝一份数据，防止移除竞争码时对原数据造成影响
-	del_emulation_prevention(dataBuf, &dataSize);
-
-	sps_bit_stream bs = { 0 };
-	sps_bs_init(&bs, dataBuf, dataSize);   //初始化SPS数据流结构体
-
-	u(&bs, 1);      //forbidden_zero_bit
-	u(&bs, 2);      //nal_ref_idc
-	UINT nal_unit_type = u(&bs, 5);
-
-	if (nal_unit_type == 0x7) {     //Nal SPS Flag
-		info->profile_idc = u(&bs, 8);
-		u(&bs, 1);      //constraint_set0_flag
-		u(&bs, 1);      //constraint_set1_flag
-		u(&bs, 1);      //constraint_set2_flag
-		u(&bs, 1);      //constraint_set3_flag
-		u(&bs, 1);      //constraint_set4_flag
-		u(&bs, 1);      //constraint_set4_flag
-		u(&bs, 2);      //reserved_zero_2bits
-		info->level_idc = u(&bs, 8);
-
-		ue(&bs);    //seq_parameter_set_id
-
-		UINT chroma_format_idc = 1;     //摄像机出图大部分格式是4:2:0
-		if (info->profile_idc == 100 || info->profile_idc == 110 || info->profile_idc == 122 ||
-			info->profile_idc == 244 || info->profile_idc == 44 || info->profile_idc == 83 ||
-			info->profile_idc == 86 || info->profile_idc == 118 || info->profile_idc == 128 ||
-			info->profile_idc == 138 || info->profile_idc == 139 || info->profile_idc == 134 || info->profile_idc == 135) {
-			chroma_format_idc = ue(&bs);
-			if (chroma_format_idc == 3) {
-				u(&bs, 1);      //separate_colour_plane_flag
-			}
-
-			ue(&bs);        //bit_depth_luma_minus8
-			ue(&bs);        //bit_depth_chroma_minus8
-			u(&bs, 1);      //qpprime_y_zero_transform_bypass_flag
-			UINT seq_scaling_matrix_present_flag = u(&bs, 1);
-			if (seq_scaling_matrix_present_flag) {
-				UINT seq_scaling_list_present_flag[8] = { 0 };
-				for (INT i = 0; i < ((chroma_format_idc != 3) ? 8 : 12); i++) {
-					seq_scaling_list_present_flag[i] = u(&bs, 1);
-					if (seq_scaling_list_present_flag[i]) {
-						if (i < 6) {    //scaling_list(ScalingList4x4[i], 16, UseDefaultScalingMatrix4x4Flag[i])
-						}
-						else {    //scaling_list(ScalingList8x8[i − 6], 64, UseDefaultScalingMatrix8x8Flag[i − 6] )
-						}
-					}
-				}
-			}
-		}
-
-		ue(&bs);        //log2_max_frame_num_minus4
-		UINT pic_order_cnt_type = ue(&bs);
-		if (pic_order_cnt_type == 0) {
-			ue(&bs);        //log2_max_pic_order_cnt_lsb_minus4
-		}
-		else if (pic_order_cnt_type == 1) {
-			u(&bs, 1);      //delta_pic_order_always_zero_flag
-			se(&bs);        //offset_for_non_ref_pic
-			se(&bs);        //offset_for_top_to_bottom_field
-
-			UINT num_ref_frames_in_pic_order_cnt_cycle = ue(&bs);
-			INT* offset_for_ref_frame = (INT*)malloc((UINT)num_ref_frames_in_pic_order_cnt_cycle * sizeof(INT));
-			for (INT i = 0; i < num_ref_frames_in_pic_order_cnt_cycle; i++) {
-				offset_for_ref_frame[i] = se(&bs);
-			}
-			free(offset_for_ref_frame);
-		}
-
-		ue(&bs);      //max_num_ref_frames
-		u(&bs, 1);      //gaps_in_frame_num_value_allowed_flag
-
-		UINT pic_width_in_mbs_minus1 = ue(&bs);     //第36位开始
-		UINT pic_height_in_map_units_minus1 = ue(&bs);      //47
-		UINT frame_mbs_only_flag = u(&bs, 1);
-
-		info->width = (INT)(pic_width_in_mbs_minus1 + 1) * 16;
-		info->height = (INT)(2 - frame_mbs_only_flag) * (pic_height_in_map_units_minus1 + 1) * 16;
-
-		if (!frame_mbs_only_flag) {
-			u(&bs, 1);      //mb_adaptive_frame_field_flag
-		}
-
-		u(&bs, 1);     //direct_8x8_inference_flag
-		UINT frame_cropping_flag = u(&bs, 1);
-		if (frame_cropping_flag) {
-			UINT frame_crop_left_offset = ue(&bs);
-			UINT frame_crop_right_offset = ue(&bs);
-			UINT frame_crop_top_offset = ue(&bs);
-			UINT frame_crop_bottom_offset = ue(&bs);
-
-			//See 6.2 Source, decoded, and output picture formats
-			INT crop_unit_x = 1;
-			INT crop_unit_y = 2 - frame_mbs_only_flag;      //monochrome or 4:4:4
-			if (chroma_format_idc == 1) {   //4:2:0
-				crop_unit_x = 2;
-				crop_unit_y = 2 * (2 - frame_mbs_only_flag);
-			}
-			else if (chroma_format_idc == 2) {    //4:2:2
-				crop_unit_x = 2;
-				crop_unit_y = 2 - frame_mbs_only_flag;
-			}
-
-			info->width -= crop_unit_x * (frame_crop_left_offset + frame_crop_right_offset);
-			info->height -= crop_unit_y * (frame_crop_top_offset + frame_crop_bottom_offset);
-		}
-
-		UINT vui_parameters_present_flag = u(&bs, 1);
-		if (vui_parameters_present_flag) {
-			vui_para_parse(&bs, info);
-		}
-
-		ret = 1;
-	}
-	free(dataBuf);
-
-	return ret;
 }
 
 Header parase_h264(int len)
@@ -569,8 +331,6 @@ Header parase_h264(int len)
 		{
 	
 			h264_parse_sps(arr_name + index - 1, len1 - index + 1, &sps);
-
-
 			break;	
 		}
 		case NALU_TYPE_PPS:
@@ -649,6 +409,7 @@ Header parase_pes(unsigned char* arr_name, int& index, int len ,unsigned int& re
 			int marter_bit1_d = arr_name[index + 2] & 0x01;
 			int DTS14_0 = (arr_name[index + 3] << 7) | ((arr_name[index + 4] & 0xfe) >> 1);
 			int marter_bit2_d = arr_name[index + 4] & 0x01;
+			video_frame.pts = video_frame.pts / 90;
 			index += 5;
 			std::cout <<"index:" << index << ":0xe0:" ;
 
@@ -667,17 +428,14 @@ Header parase_pes(unsigned char* arr_name, int& index, int len ,unsigned int& re
 			index += 5;
 			std::cout<< "index:" << index << ":0xc0:";
 
-			unsigned long long pts = (PTS32_30 << 30) + (PTS29_15 << 15) + PTS14_0;
-			video_frame.stamp = pts / 90;
+			video_frame.pts = (PTS32_30 << 30) + (PTS29_15 << 15) + PTS14_0;
+			video_frame.stamp = video_frame.pts / 90;
 		}
 		else 
 		{
 			remain_len = len - start_index + 4;
 			return Header::ps_packet_head_loading;
 		}
-
-
-
 
 		if (index > len)//解析头时 缓存数据不够
 		{
@@ -693,11 +451,9 @@ Header parase_pes(unsigned char* arr_name, int& index, int len ,unsigned int& re
 				video_frame.len += len - index;
 			}
 
-
 			std::cout << "::index:" << index << ":index == len" << std::endl;
 			remain_len = 0;
 			reserve = packet_end - len;
-			//index_globe += packet_end - 1;
 			saveH264(reinterpret_cast<const char*>(arr_name + index), len - index, false);
 			return Header::ps_data_loading;
 		}
@@ -708,8 +464,6 @@ Header parase_pes(unsigned char* arr_name, int& index, int len ,unsigned int& re
 				memcpy(video_frame.buff_frame + video_frame.len, arr_name + index, PES_packet_length - PES_header_data_length - 3);
 				video_frame.len += PES_packet_length - PES_header_data_length - 3;
 			}
-
-
 			remain_len = 0;
 			saveH264(reinterpret_cast<const char*>(arr_name + index), PES_packet_length - PES_header_data_length - 3, false);
 			parase_h264(PES_packet_length - PES_header_data_length - 3);
@@ -727,6 +481,7 @@ Header parase_pes(unsigned char* arr_name, int& index, int len ,unsigned int& re
 
 }
 
+//少了最后一帧
 Header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 {
 	static unsigned int reserve = 0; //还有多少字节没有保存
@@ -766,16 +521,18 @@ Header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 			
 			if (video_frame.len > 0) 
 			{
+				//pushStream(video_frame.buff_frame, video_frame.len,"rtsp://localhost:554/tes");
 				char buff[1024 * 600] = {0};
 				int len1 = FM_MakeVideoFrame(video_frame.stamp, sps.width, sps.height, FM_VIDEO_ALG_H264, video_frame.is_key, (char *)video_frame.buff_frame, video_frame.len, buff, 1024 * 600);
 
-				ofstream fd1("add.h264", ios::out | ios::binary | ios::app);
+				ofstream fd1("add1.h264", ios::out | ios::binary | ios::app);
 				unsigned int frametype = 1;
 				if (fd1.is_open())
 				{
-					fd1.write((char *)&frametype,sizeof frametype);
-					fd1.write((char *)&len1, sizeof len1);
-					fd1.write(buff, len1);
+					fd1.write((char*)video_frame.buff_frame, video_frame.len);
+					//fd1.write((char *)&frametype,sizeof frametype);
+					//fd1.write((char *)&len1, sizeof len1);
+					//fd1.write(buff, len1);
 					fd1.close();
 				}
 			}
@@ -783,7 +540,7 @@ Header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 			video_frame.is_key = false;
 			video_frame.len = 0;
 			video_frame.stamp = 0;
-			memset(video_frame.buff_frame, 0, 1024 * 1024);
+			memset(video_frame.buff_frame, 0, 1024 * 400);
 
 			int start_index = index;
 			int stuff_byte = arr_name[index + 13] & 0x07;
@@ -913,7 +670,6 @@ Header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 		default:
 			cout << "default:" << (int)arr_name[index] << ":" << (int)arr_name[index + 1] << ":" << (int)arr_name[index + 2] << ":" << (int)arr_name[index + 3] << endl;
 			std::cout << "index:" << index << std::endl;
-			std::cout << "123444444444" << std::endl;
 
 		}
 	
@@ -927,7 +683,7 @@ void download(const char* Url, const char* save_as)	/*将Url指向的地址的�
 	video_frame.len = 0;
 	video_frame.stamp = 0;
 	video_frame.is_key = false;
-	memset(video_frame.buff_frame, 0, 1024 * 1024);
+	memset(video_frame.buff_frame, 0, 1024 * 400);
 	sps.fps = 0;
 	sps.height = 0;
 	sps.width = 0;
@@ -990,8 +746,13 @@ void download(const char* Url, const char* save_as)	/*将Url指向的地址的�
 	}
 }
 
+
+
+
 int main(int argc, char* argv[]) {
 	//http://172.22.72.1:9580/test.ps
-	download("http://172.22.172.1:9580/876221_13660360807_3ZWCA333447FELB.ps", "c:/q.ps");/*调用示例，下载百度的首页到c:\index.html文件*/
+
+	//download("http://172.22.172.1:9580/876221_13660360807_3ZWCA333447FELB.ps", "c:/q.ps");/*调用示例，下载百度的首页到c:\index.html文件*/
+	pushStream("add1.h264","rtsp://localhost:554/t");
 	return 0;
 }
