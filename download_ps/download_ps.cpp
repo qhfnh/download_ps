@@ -1,211 +1,339 @@
+ï»¿//windows
+#ifdef WIN32
+
 #include <windows.h>
 #include <wininet.h>
-#include <atlconv.h>
-
-#include <iostream>
-#include <fstream>
-#include <cstring>
 #include <tchar.h>
-#include "PsPacket.h"
 #include <atlbase.h>
-#define _CRT_SECURE_NO_WARNINGS
+#pragma comment( lib, "wininet.lib" )
 
-constexpr auto MAXBLOCKSIZE = 1024 * 10 +100;
+#endif // WIN32
+
+#include <atlconv.h>
+#include <iostream>
+#include <sstream>
+#include <fstream>
+#include<thread>
+#include<mutex>
+#include <cstring>
+#include <time.h>
+#include "PsPacket.h"
+#include "Header.h"
+#include <queue>
+
+//// ffmpeg
+extern "C" 
+{
+	#include <libavcodec/avcodec.h>
+	#include <libavformat/avformat.h>
+	#include <libswscale/swscale.h>
+	#include <libavutil/pixfmt.h>
+	#include <libavutil/imgutils.h>
+	#include <libavutil/parseutils.h>
+	#include <libavutil/opt.h>
+	#include <libswscale/swscale.h>
+	#include <libavutil/time.h>
+
+};
+#pragma comment (lib, "avcodec.lib")
+#pragma comment (lib, "avdevice.lib")
+#pragma comment (lib, "avfilter.lib")
+#pragma comment (lib, "avformat.lib")
+#pragma comment (lib, "avutil.lib")
+#pragma comment (lib, "swresample.lib")
+#pragma comment (lib, "swscale.lib")
+
+constexpr auto MAXBLOCKSIZE = 1024 * 10 + 100 ;			//ç¼“å­˜å¤§å°
+
+#define IO_BUFFER_SIZE 1024 * 32
+
 #define EQUITPREFIX(arr_name,index) (arr_name[index] == 0 && arr_name[index + 1] == 0 && arr_name[index + 2] == 1)
 #define EQUIT00(arr_name,index) (arr_name[index] == 0 && arr_name[index + 1] == 0 && arr_name[index + 2] == 0)
 #define EQUITBIT(arr_name,index,t) arr_name[index] == 0 && arr_name[index + 1] == 0 && arr_name[index + 2] == 1 && arr_name[index + 3] == t
 #define SUMLEN(arr_name,index)  arr_name[index] << 8 | arr_name[index + 1]
 //#define GETBIT(arr_name,index,start,len) (arr_name[index] & (1 <<)) >> start
-#pragma comment( lib, "wininet.lib" )
- 
+bool g_is_video = true;
+VIDEO_FRAME video_frame;
+sps_info_struct sps;
+
+
+//FILE* fp_open;
+
+mutex m;
+queue <int> products;
+condition_variable cond;
+bool notify = false;
+
+
+
+
+
+int fill_iobuffer(void* opaque, uint8_t* buf, int buf_size)
+{
+	//if (!feof(fp_open)) {
+	//	int true_size = fread(buf, 1, buf_size, fp_open);
+	//	return true_size;
+	//}
+	//else {
+	//	return -1;
+	//}
+		static int  sum = 0;
+		//ä¸Šé”ä¿æŠ¤å…±äº«èµ„æº,unique_lockä¸€æ¬¡å®ç°ä¸Šé”å’Œè§£é”
+		unique_lock<mutex>lk(m);
+		//ç­‰å¾…ç”Ÿäº§è€…è€…é€šçŸ¥æœ‰èµ„æº
+		while (!notify) {
+
+			cond.wait(lk);
+		}
+
+		//è¦æ˜¯é˜Ÿåˆ—ä¸ä¸ºç©ºçš„è¯
+		if (!products.empty()) {
+
+			if (sum + buf_size <= video_frame.len)
+			{
+				memcpy_s(buf, buf_size, video_frame.buff_frame + sum, buf_size);
+				sum += buf_size;
+				return buf_size;
+			}
+			else if (sum <= video_frame.len)
+			{
+				
+				int len1 = video_frame.len - sum;
+				memcpy_s(buf, buf_size, video_frame.buff_frame + sum, len1);
+				sum = 0;
+				products.pop();
+				//é€šçŸ¥ç”Ÿäº§è€…ä»“åº“å®¹é‡ä¸è¶³,ç”Ÿäº§äº§å“
+				notify = false;
+				cond.notify_one();
+				return len1;
+			}
+			else
+			{
+				std::cout << "buf_size:" << buf_size << "  video_frame.len:" << video_frame.len << std::endl;
+				system("pause");
+				return -1;
+			}
+
+		}
+	}
+
+
+int pushStream( const char* url ,const unsigned char* data = NULL, int len = 0)
+{
+
+	AVInputFormat* ifmt_v = NULL;
+	AVOutputFormat* ofmt = NULL;
+	AVFormatContext* ifmt_ctx_v = NULL, * ofmt_ctx = NULL;
+	AVPacket pkt;
+	int ret, i;
+	int videoindex_v = -1, videoindex_out = -1;
+	int frame_index = 0;
+	int64_t cur_pts_v = 0;
+	AVStream* out_stream = NULL;
+	AVStream* in_stream = NULL;
+	//fp_open = fopen(in_filename_v, "rb+");
+
+	ifmt_ctx_v = avformat_alloc_context();
+
+
+	unsigned char* iobuffer = (unsigned char*)av_malloc(IO_BUFFER_SIZE);
+	AVIOContext* avio = avio_alloc_context(iobuffer, IO_BUFFER_SIZE, 0, NULL, fill_iobuffer, NULL, NULL);
+	ifmt_ctx_v->pb = avio;
+	ifmt_v = av_find_input_format("h264");
+	if ((ret = avformat_open_input(&ifmt_ctx_v, NULL, ifmt_v, NULL)) < 0) {
+		printf("Could not open input file.");
+		goto end;
+	}
+
+	if ((ret = avformat_find_stream_info(ifmt_ctx_v, 0)) < 0) {
+		printf("Failed to retrieve input stream information");
+		goto end;
+	}
+
+	printf("===========Input Information==========\n");
+	//av_dump_format(ifmt_ctx_v, 0, in_filename_v, 0);
+	printf("======================================\n");
+	avformat_alloc_output_context2(&ofmt_ctx, NULL, "rtsp", url);
+	if (!ofmt_ctx) {
+		printf("Could not create output context\n");
+		ret = AVERROR_UNKNOWN;
+		goto end;
+	}
+	av_opt_set(ofmt_ctx->priv_data, "rtsp_transport", "tcp", 0);
+
+	ofmt = ofmt_ctx->oformat;
+	in_stream = ifmt_ctx_v->streams[0];
+
+	out_stream = avformat_new_stream(ofmt_ctx, NULL);
+	videoindex_v = 0;
+	if (!out_stream) {
+		printf("Failed allocating output stream\n");
+		ret = AVERROR_UNKNOWN;
+		goto end;
+	}
+	videoindex_out = out_stream->index;
+	//Copy the settings of AVCodecContext
+	if (avcodec_copy_context(out_stream->codec, in_stream->codec) < 0) {
+		printf("Failed to copy context from input to output stream codec context\n");
+		goto end;
+	}
+	out_stream->codec->codec_tag = 0;
+	/* Some formats want stream headers to be separate. */
+	if (ofmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
+		out_stream->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+		std::cout << "ppppp" << std::endl;
+
+	printf("==========Output Information==========\n");
+	av_dump_format(ofmt_ctx, 0, url, 1);
+	printf("======================================\n");
+	//Open output file
+	if (!(ofmt->flags & AVFMT_NOFILE)) {
+		if (avio_open(&ofmt_ctx->pb, url , AVIO_FLAG_WRITE) < 0) {
+			printf("Could not open output file '%s'", url);
+			goto end;
+		}
+	}
+
+
+	if (avformat_write_header(ofmt_ctx, NULL) < 0) {
+		printf("Error occurred when opening output file\n");
+		goto end;
+	}
+	while (1) {
+		AVFormatContext* ifmt_ctx;
+		int stream_index = 0;
+		//AVStream* in_stream, * out_stream;
+
+		//Get an AVPacket
+		ifmt_ctx = ifmt_ctx_v;
+		stream_index = videoindex_out;
+
+		if (av_read_frame(ifmt_ctx, &pkt) >= 0) {
+			do {
+				in_stream = ifmt_ctx->streams[pkt.stream_index];
+				out_stream = ofmt_ctx->streams[stream_index];
+
+				if (pkt.stream_index == videoindex_v) {
+					//FIXï¼šNo PTS (Example: Raw H.264)
+					//Simple Write PTS
+					if (pkt.pts == AV_NOPTS_VALUE) {
+						//Write PTS
+						AVRational time_base1 = in_stream->time_base;
+						//Duration between 2 frames (Î¼s)
+						int64_t calc_duration = (double)AV_TIME_BASE / av_q2d(in_stream->r_frame_rate);
+						//Parameters
+						pkt.pts = (double)(frame_index * calc_duration) / (double)(av_q2d(time_base1) * AV_TIME_BASE);
+						pkt.dts = pkt.pts;
+						pkt.duration = (double)calc_duration / (double)(av_q2d(time_base1) * AV_TIME_BASE);
+						frame_index++;
+					}
+					cur_pts_v = pkt.pts;
+					break;
+				}
+			} while (av_read_frame(ifmt_ctx, &pkt) >= 0);
+		}
+		else 
+		{
+			break;
+		}
+
+		//Convert PTS/DTS
+		pkt.pts = av_rescale_q_rnd(pkt.pts, in_stream->time_base, out_stream->time_base, (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+		pkt.dts = av_rescale_q_rnd(pkt.dts, in_stream->time_base, out_stream->time_base, (AVRounding)(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+		pkt.duration = av_rescale_q(pkt.duration, in_stream->time_base, out_stream->time_base);
+		pkt.pos = -1;
+		pkt.stream_index = stream_index;
+
+		av_usleep(pkt.duration);
+		printf("Write 1 Packet. size:%5d\tpts:%lld\n", pkt.size, pkt.pts);
+		//Write
+		if (av_interleaved_write_frame(ofmt_ctx, &pkt) < 0) {
+			printf("Error muxing packet\n");
+			break;
+		}
+		av_free_packet(&pkt);
+
+	}
+
+
+	//Write file trailer
+	av_write_trailer(ofmt_ctx);
+end:
+	avformat_close_input(&ifmt_ctx_v);
+	/* close output */
+	if (ofmt_ctx && !(ofmt->flags & AVFMT_NOFILE))
+		avio_close(ofmt_ctx->pb);
+	avformat_free_context(ofmt_ctx);
+	//fclose(fp_open);
+	if (ret < 0 && ret != AVERROR_EOF) 
+{
+		printf("Error occurred.\n");
+		return -1;
+	}
+	//return 0;
+	//avformat_network_init();//éœ€è¦ååˆå§‹åŒ– avformat_network_deinit(void);
+	
+	return 0;
+}
 /**
-* arr_name  ÎªÊı×éµÄÃû×Ö
-* index »òindex_xxx ×ÜÊÇÒª½âÎöµÄÎ»ÖÃ£¬²¢ÇÒÊÇarr_nameµÄ¾ø¶ÔÎ»ÖÃ
+* arr_name  ä¸ºæ•°ç»„çš„åå­—
+* index æˆ–index_xxx æ€»æ˜¯è¦è§£æçš„ä½ç½®ï¼Œå¹¶ä¸”æ˜¯arr_nameçš„ç»å¯¹ä½ç½®
 * 
 * 
 */
 
-//struct AppParam
-//{
-//	char  srcFile[256];
-//	char  dstFile[256];
-//};
-//
-//AppParam g_appParam;
-//
-//
-//void processParams(int argc, char* argv[], AppParam* param)
-//{
-//	int paramNums = 0;
-//
-//	memset(param, 0, sizeof(AppParam));
-//
-//	for (int i = 1; i < argc; i++)
-//	{
-//
-//		if ((_stricmp(argv[i], "-s") == 0) && (i < argc - 1))
-//		{
-//			//paramNums = _stscanf(argv[++i], _T("%s"), param->srcFile);
-//			if (paramNums != 1)
-//				continue;
-//		}
-//
-//		else if ((_stricmp(argv[i], "-d") == 0) && (i < argc - 1))
-//		{
-//			//paramNums = _stscanf(argv[++i], _T("%s"), param->dstFile);
-//			if (paramNums != 1)
-//				continue;
-//
-//		}
-//	}
-//}
-//
-//
-//int GetH246FromPs(const char* szPsFile, const char* szEsFile, int* h264length)
-//{
-//	PSPacket psDemux;
-//	//psDemux.SetRealTime(true); //Èç¹ûÊäÈëµÄÊÇÊµÊ±Á÷£¬ĞèÒªÉèÖÃÕâ¸ö¿ª¹Ø
-//
-//	psDemux.m_ProgramMap.clear();
-//
-//	FILE* poutfile = NULL;
-//	FILE* pinfile = NULL;
-//
-//	if (pinfile == NULL)
-//	{
-//		if (NULL == (pinfile = fopen(szPsFile, "rb")))
-//		{
-//			printf("Error: Open inputfilename file error\n");
-//			return -1;
-//		}
-//	}
-//
-//	if (poutfile == NULL)
-//	{
-//		if (NULL == (poutfile = fopen(szEsFile, "wb")))
-//		{
-//			printf("Error: Open outputfilename file error\n");
-//			return -1;
-//		}
-//	}
-//
-//	fseek(pinfile, 0, SEEK_END);
-//	int  file_len = ftell(pinfile);
-//
-//	fseek(pinfile, 0, SEEK_SET);
-//
-//	char* buffer = NULL;
-//	int length = 0;
-//
-//	const int read_chunk_size = 64 * 1024;
-//
-//	buffer = new char[read_chunk_size];
-//	memset(buffer, 0, read_chunk_size);
-//
-//	int nLeftLen = file_len;
-//
-//	int nReadLen = 0;
-//	int nVFrameNum = 0;
-//	int nAFrameNum = 0;
-//
-//	*h264length = 0;
-//
-//	DWORD dwStartTick = GetTickCount();
-//
-//	while (nLeftLen > 0)
-//	{
-//		nReadLen = min(read_chunk_size, nLeftLen); //Ã¿´Î´ÓÎÄ¼ş¶Á64K
-//
-//		fread(buffer, 1, nReadLen, pinfile); //½«ÎÄ¼şÊı¾İ¶Á½øBuffer
-//
-//		psDemux.PSWrite(buffer, nReadLen);
-//
-//		int nOutputVideoEsSize = 0;
-//
-//		while (1)
-//		{
-//
-//			naked_tuple es_packet = psDemux.naked_payload();
-//			if (!es_packet.bContainData || es_packet.nDataLen == 0)
-//				break;
-//
-//			if (es_packet.nStreamID == 0xE0)
-//			{
-//				int fwrite_number = fwrite(es_packet.pDataPtr, 1, es_packet.nDataLen, poutfile);
-//				*h264length += es_packet.nDataLen;
-//				nOutputVideoEsSize += es_packet.nDataLen;
-//
-//				printf("[%x]VFrameNum: %d, EsLen: %d, pts: %lld \n", es_packet.nStreamID, nVFrameNum++, es_packet.nDataLen, es_packet.ptsTime);
-//			}
-//			else
-//			{
-//				//printf("[%x]AFrameNum: %d, EsLen: %d \n", es_packet.nStreamID, nAFrameNum++, es_packet.nDataLen);
-//			}
-//		}
-//
-//		//ATLTRACE("WritePos: %d, ReadPos: %d, OutputEsSize: %d \n",  psDemux.GetWritePos(), psDemux.GetReadPos(), nOutputVideoEsSize);
-//
-//		nLeftLen -= nReadLen;
-//	}
-//	///
-//
-//	int nSize = psDemux.m_ProgramMap.size();
-//	for (int i = 0; i < nSize; i++)
-//	{
-//		program_map_info& map_info = psDemux.m_ProgramMap[i];
-//		printf("stream_id: %x, stream_type: %x \n", map_info.elementary_stream_id, map_info.stream_type);
-//	}
-//	printf("Time cost %ld secs \n", (GetTickCount() - dwStartTick) / 1000);
-//
-//	fclose(pinfile);
-//	fclose(poutfile);
-//
-//	delete buffer;
-//
-//	return *h264length;
-//}
-//
-// 
-typedef enum 
-{
-	ps_packet_head_loading,
-	ps_data_loading,
-	ps_continue,
-	ps_error, 
-}header;
 
-typedef enum {
-	NALU_TYPE_SLICE = 1,
-	NALU_TYPE_DPA = 2,
-	NALU_TYPE_DPB = 3,
-	NALU_TYPE_DPC = 4,
-	NALU_TYPE_IDR = 5,
-	NALU_TYPE_SEI = 6,
-	NALU_TYPE_SPS = 7,
-	NALU_TYPE_PPS = 8,
-	NALU_TYPE_AUD = 9,
-	NALU_TYPE_EOSEQ = 10,
-	NALU_TYPE_EOSTREAM = 11,
-	NALU_TYPE_FILL = 12,
-} NaluType;
 
-void saveH264(const char *arr_name,int index,int arr_len,int len) // ·ÀÖ¹Ô½½ç
+
+void saveH264(const char* data, int len, bool is_add)
 {
-	if (index >= arr_len)
+	if (!g_is_video)
 	{
-		return ;
+		return;
 	}
 	ofstream fd;
 	fd.open("ps.h264", ios::out | ios::binary | ios::app);
 	if (fd.is_open())
 	{
-		fd.write(arr_name + index, len);
+		fd.write(data, len);
 		fd.close();
 	}
+	//åªä¿ç•™ä¸€ä¸ªPESåŒ…
+	ofstream fd_frame;
+	if (is_add)
+	{
+		fd_frame.open("pes.h264.data", ios::out | ios::binary | ios::app);
+	}
+	else
+	{
+		fd_frame.open("pes.h264.data", ios::out | ios::binary);
+	}
+
+	if (fd_frame.is_open())
+	{
+		fd_frame.write(data, len);
+		fd_frame.close();
+	}
+
 }
 
-header parase_h264(unsigned char* arr_name, int index,int len)
+Header parase_h264(int len)
 {
+	ifstream fd_frame;
+	fd_frame.open("pes.h264.data", ios::in | ios::binary);
+	if (!fd_frame.is_open())
+	{
+		return ps_error;
+	}
+	int index = 0;
+	std::cout << "len" << len << std::endl;
+	std::stringstream strstream;
+	strstream << fd_frame.rdbuf();
+	fd_frame.close();
+	std::string str_name = strstream.str();
+	unsigned int len1 = str_name.length();
+	unsigned char* arr_name = (unsigned char*)str_name.data();
+
 	if (EQUITPREFIX(arr_name,index))
 	{
 		index += 3;
@@ -249,18 +377,9 @@ header parase_h264(unsigned char* arr_name, int index,int len)
 		}
 		case NALU_TYPE_SPS:
 		{
-			int profile_ide = arr_name[index ++];
-			int constraint_set0_flag = (arr_name[index]  & 0x80) >> 7;
-			int constraint_set1_flag = (arr_name[index] & 0x40) >> 6;
-			int constraint_set2_flag = (arr_name[index] & 0x20) >> 5;
-			int constraint_set3_flag = (arr_name[index] & 0x10) >> 4;
-			int constraint_set4_flag = (arr_name[index] & 0x08) >> 3;
-			int constraint_set5_flag = (arr_name[index] & 0x04) >> 2;
-			int reserved_zero_2bit	=  arr_name[index] & 0x03;
-			int level_idc = arr_name[++index];
-
-
-			break;
+	
+			h264_parse_sps(arr_name + index - 1, len1 - index + 1, &sps);
+			break;	
 		}
 		case NALU_TYPE_PPS:
 		{
@@ -285,12 +404,11 @@ header parase_h264(unsigned char* arr_name, int index,int len)
 	}
 }
 
-
-header parase_pes(unsigned char* arr_name, int& index, int len, unsigned int& reserve, int& remain_len)
+Header parase_pes(unsigned char* arr_name, int& index, int len ,unsigned int& reserve, int& remain_len)
 {
 	int start_index = index;
 	int PES_packet_length = SUMLEN(arr_name, index);
-	int packet_end = index + PES_packet_length + 2;//Õâ¸ö°üµÄ½áÎ²
+	int packet_end = index + PES_packet_length + 2;//è¿™ä¸ªåŒ…çš„ç»“å°¾
 
 	//int PES_header_data_length = arr_name[index + 4];
 
@@ -339,6 +457,7 @@ header parase_pes(unsigned char* arr_name, int& index, int len, unsigned int& re
 			int marter_bit1_d = arr_name[index + 2] & 0x01;
 			int DTS14_0 = (arr_name[index + 3] << 7) | ((arr_name[index + 4] & 0xfe) >> 1);
 			int marter_bit2_d = arr_name[index + 4] & 0x01;
+			video_frame.pts = video_frame.pts / 90;
 			index += 5;
 			std::cout <<"index:" << index << ":0xe0:" ;
 
@@ -357,82 +476,138 @@ header parase_pes(unsigned char* arr_name, int& index, int len, unsigned int& re
 			index += 5;
 			std::cout<< "index:" << index << ":0xc0:";
 
+			video_frame.pts = (PTS32_30 << 30) + (PTS29_15 << 15) + PTS14_0;
+			video_frame.stamp = video_frame.pts / 90;
 		}
 		else 
 		{
 			remain_len = len - start_index + 4;
-			return header::ps_packet_head_loading;
+			return Header::ps_packet_head_loading;
 		}
 
-
-
-
-		if (index > len)//½âÎöÍ·Ê± »º´æÊı¾İ²»¹»
+		if (index > len)//è§£æå¤´æ—¶ ç¼“å­˜æ•°æ®ä¸å¤Ÿ
 		{
 			std::cout << "::index:" << index <<":index > len" <<std::endl;
 			remain_len = len - start_index + 4;
-			return header::ps_packet_head_loading;
+			return Header::ps_packet_head_loading;
 		}
-		else if (packet_end >= len || index == len) //½âÎöÊı¾İ  Êı¾İÊ±²»¹»
+		else if (packet_end >= len || index == len) //è§£ææ•°æ®  æ•°æ®æ—¶ä¸å¤Ÿ
 		{
+			if (g_is_video) //åªæ·»åŠ è§†é¢‘ åŒ…å«psåŒ…ä¸­çš„æ‰€ç”¨pesï¼ˆoxe0ï¼‰
+			{
+				memcpy(video_frame.buff_frame + video_frame.len, arr_name + index, len - index);
+				video_frame.len += len - index;
+			}
+
 			std::cout << "::index:" << index << ":index == len" << std::endl;
 			remain_len = 0;
 			reserve = packet_end - len;
-			//index_globe += packet_end - 1;
-			saveH264(reinterpret_cast<const char*>(arr_name), index, len, len - index);
-			return header::ps_data_loading;
+			saveH264(reinterpret_cast<const char*>(arr_name + index), len - index, false);
+			return Header::ps_data_loading;
 		}
-		else //Õı³£½âÎö
+		else //æ­£å¸¸è§£æ
 		{
+			if (g_is_video) ////åªæ·»åŠ è§†é¢‘
+			{
+				memcpy(video_frame.buff_frame + video_frame.len, arr_name + index, PES_packet_length - PES_header_data_length - 3);
+				video_frame.len += PES_packet_length - PES_header_data_length - 3;
+			}
 			remain_len = 0;
-			saveH264(reinterpret_cast<const char*>(arr_name), index, len, PES_packet_length - PES_header_data_length - 3);
+			saveH264(reinterpret_cast<const char*>(arr_name + index), PES_packet_length - PES_header_data_length - 3, false);
+			parase_h264(PES_packet_length - PES_header_data_length - 3);
 			index = packet_end;
 			std::cout << (int)arr_name[index] << ":" << (int)arr_name[index + 1] << ":" << (int)arr_name[index + 2] << ":" << (int)arr_name[index + 3] << std::endl;
-			return header::ps_continue;
+			return Header::ps_continue;
 		}
 
 	}
 	else 
 	{
 		remain_len = len - start_index + 4;
-		return header::ps_packet_head_loading;
+		return Header::ps_packet_head_loading;
 	}
 
 }
 
-header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
+//å°‘äº†æœ€åä¸€å¸§
+Header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 {
-	int a = (int)arr_name[len];
-	cout << "a:" << a << endl;
-	//static unsigned long long index_globe = 0; //È«¾ÖÎÄ¼şË÷Òı  
-	static unsigned int reserve = 0; //»¹ÓĞ¶àÉÙ×Ö½ÚÃ»ÓĞ±£´æ
-	int index = 0;//µ±Ç°ÎÄ¼şË÷Òı
-	if (reserve >= len) //´¦ÀíÊı¾İÖĞ¶Ï
+	static unsigned int reserve = 0; //è¿˜æœ‰å¤šå°‘å­—èŠ‚æ²¡æœ‰ä¿å­˜
+	int index = 0;//å½“å‰æ–‡ä»¶ç´¢å¼•
+	if (reserve >= len) //å¤„ç†æ•°æ®ä¸­æ–­
 	{
-		saveH264(reinterpret_cast<const char*>(arr_name), index, len, len);
+		if (g_is_video) 
+		{
+			memcpy(video_frame.buff_frame + video_frame.len, arr_name + index, len);
+			video_frame.len += len;
+		}
+
+		saveH264(reinterpret_cast<const char*>(arr_name + index), len, true);
 		reserve -= len;
 		return ps_data_loading;
 	}
 	else if (reserve > 0 && reserve < len)
 	{
-		saveH264(reinterpret_cast<const char*>(arr_name), index, len, reserve);
+		if (g_is_video)
+		{
+			memcpy(video_frame.buff_frame + video_frame.len, arr_name + index, reserve);
+			video_frame.len += reserve;
+		}
+
+		saveH264(reinterpret_cast<const char*>(arr_name + index), reserve, true);
 		index += reserve;
 		reserve = 0;
 	}
 
 
-	while (EQUITPREFIX(arr_name, index)|| EQUIT00(arr_name,index)) //ps °üÍ·
+	while (EQUITPREFIX(arr_name, index)|| EQUIT00(arr_name,index)) //ps åŒ…å¤´
 	{
 		switch (arr_name[index + 3])
 		{
 		case 0xba:  // ps
 		{
+			
+			if (video_frame.len > 0) 
+			{
+				
+				{
+					unique_lock<mutex>lk(m);
+					products.push(1);
+					notify = true;
+					cond.notify_one();
+					while (notify || !products.empty()) {
+
+						cond.wait(lk);
+					}					
+					
+					
+				}
+				//pushStream("rtsp://localhost:554/tes",video_frame.buff_frame, video_frame.len);
+				char buff[1024 * 600] = {0};
+				int len1 = FM_MakeVideoFrame(video_frame.stamp, sps.width, sps.height, FM_VIDEO_ALG_H264, video_frame.is_key, (char *)video_frame.buff_frame, video_frame.len, buff, 1024 * 600);
+				ofstream fd1("add1.h264", ios::out | ios::binary | ios::app);
+				unsigned int frametype = 1;
+				if (fd1.is_open())
+				{
+					//fd1.write((char*)video_frame.buff_frame, video_frame.len);
+					fd1.write((char *)&frametype,sizeof frametype);
+					fd1.write((char *)&len1, sizeof len1);
+					fd1.write(buff, len1);
+					fd1.close();
+				}
+			}
+
+			video_frame.is_key = false;
+			video_frame.len = 0;
+			video_frame.stamp = 0;
+			memset(video_frame.buff_frame, 0, 1024 * 400);
+
 			int start_index = index;
 			int stuff_byte = arr_name[index + 13] & 0x07;
 			index += stuff_byte + 14;
 			if (index > len)
 			{
-				remain_len = len - start_index; //°üº¬ +4 ÁË
+				remain_len = len - start_index; //åŒ…å« +4 äº†
 				std::cout << "0xba:" <<"index:"<<index <<": index > len "<<std::endl;
 				return ps_packet_head_loading;
 			}
@@ -447,6 +622,8 @@ header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 		}
 		case 0xbb: //sys
 		{
+			video_frame.is_key = true;
+
 			int start_index = index;
 			int sys_header_length = SUMLEN(arr_name, index + 4);
 			index = index + 6 + sys_header_length;
@@ -470,10 +647,10 @@ header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 			int start_index1 = index;
 			int program_stream_map_length = SUMLEN(arr_name, index + 4);
 			int start_index = index + 8;
-			//Ö±½ÓÌø¹ı ½âÎöÀïÃæµÄÄÚÈİÊ± ÔÚbreakÉÏ±ß index =start_index;
+			//ç›´æ¥è·³è¿‡ è§£æé‡Œé¢çš„å†…å®¹æ—¶ åœ¨breakä¸Šè¾¹ index =start_index;
 			index += program_stream_map_length + 6;
 
-			//½âÎöÀïÃæÄÚÈİ
+			//è§£æé‡Œé¢å†…å®¹
 			{
 
 				int elementary_stream_info_length = SUMLEN(arr_name, start_index);
@@ -506,77 +683,10 @@ header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 		}
 		case 0xe0: //pse
 		{
+			g_is_video = true;
 			index += 4;
-			//int PES_packet_length = SUMLEN(arr_name, index);
-			//int packet_end = index + PES_packet_length + 2;
-			////.........
-			//index += 2;
-			//int fix_biat_10 = (arr_name[index] & 0xc0) >> 6;
-			//int packet_inde = index;
-			//cout << fix_biat_10 << endl;
-			//if (2 == (arr_name[index] & 0xc0) >> 6) // '10' fix
-			//{
-			//	int PES_scrambing_control = (arr_name[index] & 0x30) >> 4;
-			//	int PES_priority = (arr_name[index] & 0x08) >> 3;
-			//	int data_alignment_indicator = (arr_name[index] & 0x04) >> 2;
-			//	int copyright = (arr_name[index] & 0x02) >> 1;
-			//	int original_or_copy = arr_name[index] & 0x01;
-			//	int PTS_DES_flags = (arr_name[index + 1] & 0xc0) >> 6;
-			//	int ESCR_flag = (arr_name[index + 1] & 0x20) >> 5;
-			//	int ES_rate_flag = (arr_name[index + 1] & 0x10) >> 4;
-			//	int DSM_trick_mode_flag = (arr_name[index + 1] & 0x08) >> 3;
-			//	int additional_copy_info_flag = (arr_name[index + 1] & 0x04) >> 2;
-			//	int PES_CRC_flag = (arr_name[index + 1] & 0x02) >> 1;
-			//	int PES_extrnsion_flag = arr_name[index + 1] & 0x01;
-			//	int PES_header_data_length = arr_name[index + 2];
-			//	index += 3;
-			//	if (PTS_DES_flags == 3)//PTS_DES_flags == '11'
-			//	{
-			//		cout << PTS_DES_flags << endl;
-			//		//PTS
-			//		int fix_0011 = (arr_name[index] & 0xf0) >> 4;
-			//		int PTS32_30 = (arr_name[index] & 0x0e) >> 1;
-			//		int marker_bit = arr_name[index] & 0x01;
-			//		int PTS29_15 = (arr_name[index + 1] << 7) | ((arr_name[index + 2] & 0xfe) >> 1);
-			//		int marter_bit1 = arr_name[index + 2] & 0x01;
-			//		int PTS14_0 = (arr_name[index + 3] << 7) | ((arr_name[index + 4] & 0xfe) >> 1);
-			//		int marter_bit2 = arr_name[index + 4] & 0x01;
-			//		index += 5;
-			//		//DTS
-			//		int fix_0001 = (arr_name[index] & 0xf0) >> 4;
-			//		int DTS32_30 = (arr_name[index] & 0x0e) >> 1;
-			//		int marker_bit_d = arr_name[index] & 0x01;
-			//		int DTS29_15 = (arr_name[index + 1] << 7) | ((arr_name[index + 2] & 0xfe) >> 1);
-			//		int marter_bit1_d = arr_name[index + 2] & 0x01;
-			//		int DTS14_0 = (arr_name[index + 3] << 7) | ((arr_name[index + 4] & 0xfe) >> 1);
-			//		int marter_bit2_d = arr_name[index + 4] & 0x01;
-			//		index += 5;
-			//	}
-			//	else if (PTS_DES_flags == 2)
-			//	{
-			//		cout << PTS_DES_flags << endl;
-			//		int fix_0011 = (arr_name[index] & 0xf0) >> 4;
-			//		int PTS32_30 = (arr_name[index] & 0x0e) >> 1;
-			//		int marker_bit = arr_name[index] & 0x01;
-			//		int PTS29_15 = (arr_name[index + 1] << 7) | ((arr_name[index + 2] & 0xfe) >> 1);
-			//		int marter_bit1 = arr_name[index + 2] & 0x01;
-			//		int PTS14_0 = (arr_name[index + 3] << 7) | ((arr_name[index + 4] & 0xfe) >> 1);
-			//		int marter_bit2 = arr_name[index + 4] & 0x01;
-			//		index += 5;
-			//	}
-			//	if (packet_end >= len)
-			//	{
-			//		reserve = packet_end - len;
-			//		//index_globe += packet_end - 1;
-			//		saveH264(reinterpret_cast<const char*>(arr_name), index, len, len - index);
-			//		return pe_loading;
-			//	}
-			//	saveH264(reinterpret_cast<const char*>(arr_name), index, len, PES_packet_length - PES_header_data_length - 3);
-			//	index = packet_end;
-			//	cout << "0xe0:" << (int)arr_name[index] << ":" << (int)arr_name[index + 1] << ":" << (int)arr_name[index + 2] << ":" << (int)arr_name[index + 3] << endl;
-			//	break;
-			//}
-			header sta = parase_pes(arr_name, index, len, reserve, remain_len);
+
+			Header sta = parase_pes(arr_name, index, len, reserve, remain_len);
 			if (sta == ps_packet_head_loading || sta == ps_data_loading)
 			{
 				return sta;
@@ -586,78 +696,9 @@ header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 		}
 		case 0xc0: //PSE
 		{
+			g_is_video = false;
 			index += 4;
-			//int PES_packet_length = SUMLEN(arr_name, index);
-			//int packet_end = index + PES_packet_length +2;
-			////int PES_header_data_length = arr_name[index + 4];
-			////.........
-			//index += 2;
-			//int fix_biat_10 = (arr_name[index] & 0xc0) >> 6;
-			//int packet_inde = index;
-			//cout << fix_biat_10 << endl;
-			//if (2 == (arr_name[index] & 0xc0) >> 6) // '10' fix
-			//{
-			//	int PES_scrambing_control = (arr_name[index] & 0x30) >> 4;
-			//	int PES_priority = (arr_name[index] & 0x08) >> 3;
-			//	int data_alignment_indicator = (arr_name[index] & 0x04) >> 2;
-			//	int copyright = (arr_name[index] & 0x02) >> 1;
-			//	int original_or_copy = arr_name[index] & 0x01;
-			//	int PTS_DES_flags = (arr_name[index + 1] & 0xc0) >> 6;
-			//	int ESCR_flag = (arr_name[index + 1] & 0x20) >> 5;
-			//	int ES_rate_flag = (arr_name[index + 1] & 0x10) >> 4;
-			//	int DSM_trick_mode_flag = (arr_name[index + 1] & 0x08) >> 3;
-			//	int additional_copy_info_flag = (arr_name[index + 1] & 0x04) >> 2;
-			//	int PES_CRC_flag = (arr_name[index + 1] & 0x02) >> 1;
-			//	int PES_extrnsion_flag = arr_name[index + 1] & 0x01;
-			//	int PES_header_data_length = arr_name[index + 2];
-			//	index += 3;
-			//	if (PTS_DES_flags == 3)//PTS_DES_flags == '11'
-			//	{
-			//		cout << PTS_DES_flags << endl;
-			//		//PTS
-			//		int fix_0011 = (arr_name[index] & 0xf0) >> 4;
-			//		int PTS32_30 = (arr_name[index] & 0x0e) >> 1;
-			//		int marker_bit = arr_name[index] & 0x01;
-			//		int PTS29_15 = (arr_name[index + 1] << 7) | ((arr_name[index + 2] & 0xfe) >> 1);
-			//		int marter_bit1 = arr_name[index + 2] & 0x01;
-			//		int PTS14_0 = (arr_name[index + 3] << 7) | ((arr_name[index + 4] & 0xfe) >> 1);
-			//		int marter_bit2 = arr_name[index + 4] & 0x01;
-			//		index += 5;
-			//		//DTS
-			//		int fix_0001 = (arr_name[index] & 0xf0) >> 4;
-			//		int DTS32_30 = (arr_name[index] & 0x0e) >> 1;
-			//		int marker_bit_d = arr_name[index] & 0x01;
-			//		int DTS29_15 = (arr_name[index + 1] << 7) | ((arr_name[index + 2] & 0xfe) >> 1);
-			//		int marter_bit1_d = arr_name[index + 2] & 0x01;
-			//		int DTS14_0 = (arr_name[index + 3] << 7) | ((arr_name[index + 4] & 0xfe) >> 1);
-			//		int marter_bit2_d = arr_name[index + 4] & 0x01;
-			//		index += 5;
-			//	}
-			//	else if (PTS_DES_flags == 2)
-			//	{
-			//		cout << PTS_DES_flags << endl;
-			//		int fix_0011 = (arr_name[index] & 0xf0) >> 4;
-			//		int PTS32_30 = (arr_name[index] & 0x0e) >> 1;
-			//		int marker_bit = arr_name[index] & 0x01;
-			//		int PTS29_15 = (arr_name[index + 1] << 7) | ((arr_name[index + 2] & 0xfe) >> 1);
-			//		int marter_bit1 = arr_name[index + 2] & 0x01;
-			//		int PTS14_0 = (arr_name[index + 3] << 7) | ((arr_name[index + 4] & 0xfe) >> 1);
-			//		int marter_bit2 = arr_name[index + 4] & 0x01;
-			//		index += 5;
-			//	}
-			//	if (packet_end >= len)
-			//	{
-			//		reserve = packet_end - len;
-			//		saveH264(reinterpret_cast<const char*>(arr_name),index, len, len - index);
-			//			return pe_loading;
-			//		//index_globe += packet_end - 1;
-			//	}
-			//	saveH264(reinterpret_cast<const char*>(arr_name), index, len, PES_packet_length - PES_header_data_length - 3);
-			//	index = packet_end;
-			//	cout << "0xc0:" << (int)arr_name[index] << ":"<<(int)arr_name[index + 1]  << ":"<<(int)arr_name[index + 2] << ":" << (int)arr_name[index + 3] << endl;
-			//	break;
-			//}
-			header sta = parase_pes(arr_name, index, len, reserve, remain_len);
+			Header sta = parase_pes(arr_name, index, len, reserve, remain_len);
 			if (sta == ps_packet_head_loading || sta == ps_data_loading)
 			{
 				return sta;
@@ -689,119 +730,34 @@ header ps_parase(unsigned char* arr_name, int len ,int& remain_len)
 		default:
 			cout << "default:" << (int)arr_name[index] << ":" << (int)arr_name[index + 1] << ":" << (int)arr_name[index + 2] << ":" << (int)arr_name[index + 3] << endl;
 			std::cout << "index:" << index << std::endl;
-			std::cout << "123444444444" << std::endl;
 
 		}
 	
 	}
 	return ps_error;
 }
-//header ps_parase1(unsigned char *ps) 
-//{
-//	int index = 0;
-//	int PES_end = 0;//PES½áÊøµÄÏÂÒ»×Ö½Ú
-//	if (EQUITBIT(ps,index,0xba) ) //ps °üÍ·
-//	{
-//		int stuff_byte = ps[13] & 0x07;
-//		index = stuff_byte + 14;
-//		if (EQUITBIT(ps, index, 0xbb)) 
-//		{
-//			int sys_header_length = SUMLEN(ps,index + 4);
-//			index = index + 6 + sys_header_length;
-//			if (EQUITBIT(ps, index, 0xbc))
-//			{
-//				index = index + 8;
-//				//int program_stream_map_length = ps[index] * 256 + ps[index + 1];
-//				//index = index + prograam_stream_info_length + 2;
-//				int elementary_stream_info_length = SUMLEN(ps, index);
-//				index += 2;
-//				int elementary_stream_map_length =  SUMLEN(ps, index);
-//				index = index + 2;
-//				for (int i = 0; i < elementary_stream_map_length / 4; i++)
-//				{
-//					int stream_type = ps[index];
-//					int elementary_stream_id = ps[index + 1];
-//					int elementary_stream_info_length = SUMLEN(ps, index + 2);
-//					index = index + elementary_stream_info_length + 4;
-//				}
-//				index += 4;
-//				//PES ÊÓÆµ 
-//				if (EQUITBIT(ps, index, 0xe0) || EQUITBIT(ps, index, 0xc0))
-//				{
-//					index += 4;
-//					int PES_packet_length = SUMLEN(ps,  index);
-//					index += 2;
-//					PES_end = index + PES_packet_length; //PES½áÊøµÄÏÂÒ»×Ö½Ú
-//					int fix_biat_10 = (ps[index] & 0xc0) >> 6;
-//					int packet_inde = index;
-//					cout << fix_biat_10 << endl;
-//					if (  2 == (ps[index] & 0xc0) >> 6 ) // '10' fix
-//					{
-//						int PES_scrambing_control = (ps[index] & 0x30) >> 4;
-//						int PES_priority = (ps[index] & 0x08) >> 3;
-//						int data_alignment_indicator = (ps[index] & 0x04) >> 2;
-//						int copyright = (ps[index] & 0x02) >> 1;
-//						int original_or_copy = ps[index] & 0x01;
-//
-//						int PTS_DES_flags = (ps[index + 1] & 0xc0) >> 6;
-//						int ESCR_flag = (ps[index + 1] & 0x20) >> 5;
-//						int ES_rate_flag = (ps[index + 1] & 0x10) >> 4;
-//						int DSM_trick_mode_flag = (ps[index + 1] & 0x08) >> 3;
-//						int additional_copy_info_flag = (ps[index + 1] & 0x04) >> 2;
-//						int PES_CRC_flag = (ps[index + 1] & 0x02) >> 1;
-//						int PES_extrnsion_flag = ps[index + 1] & 0x01;
-//						int PES_header_data_length = ps[index + 2];
-//						index += 3;
-//						if (PTS_DES_flags == 3)//PTS_DES_flags == '11'
-//						{
-//							cout << PTS_DES_flags << endl;
-//							//PTS
-//							int fix_0011 = (ps[index] & 0xf0) >> 4;
-//							int PTS32_30 = (ps[index] & 0x0e) >> 1;
-//							int marker_bit = ps[index] & 0x01;
-//							int PTS29_15 = (ps[index + 1] << 7) | ((ps[index + 2] & 0xfe) >> 1);
-//							int marter_bit1 = ps[index + 2] & 0x01;
-//							int PTS14_0 =  (ps[index + 3] << 7) | ((ps[index + 4] & 0xfe) >> 1);
-//							int marter_bit2 = ps[index + 4] & 0x01;
-//							index += 5;
-//							//DTS
-//							int fix_0001 = (ps[index] & 0xf0) >> 4;
-//							int DTS32_30 = (ps[index] & 0x0e) >> 1;
-//							int marker_bit_d = ps[index] & 0x01;
-//							int DTS29_15 = (ps[index + 1] << 7) | ((ps[index + 2] & 0xfe) >> 1);
-//							int marter_bit1_d = ps[index + 2] & 0x01;
-//							int DTS14_0 = (ps[index + 3] << 7) | ((ps[index + 4] & 0xfe) >> 1);
-//							int marter_bit2_d = ps[index + 4] & 0x01;
-//							index += 5;
-//						}
-//						else if (PTS_DES_flags == 2)
-//						{
-//							cout << PTS_DES_flags << endl;
-//						}
-//
-//						saveH264(reinterpret_cast<const char* >(ps + index) , PES_packet_length - PES_header_data_length - 3);
-//
-//					} 
-//
-//				}
-//			}
-//			return header::sys_header;
-//		}
-//
-//	}
-//}
 
-
-void download(const char* Url, const char* save_as)	/*½«UrlÖ¸ÏòµÄµØÖ·µÄÎÄ¼şbaiÏÂÔØµ½save_asÖ¸ÏòµÄ±¾µØÎÄ¼ş*/
+void download(const char* Url, const char* save_as)	/*å°†UrlæŒ‡å‘çš„åœ°å€çš„æ–‡ä»¶baiä¸‹è½½åˆ°save_asæŒ‡å‘çš„æœ¬åœ°æ–‡ä»¶*/
 {
+
+	video_frame.len = 0;
+	video_frame.stamp = 0;
+	video_frame.is_key = false;
+	memset(video_frame.buff_frame, 0, 1024 * 400);
+	sps.fps = 0;
+	sps.height = 0;
+	sps.width = 0;
+	sps.profile_idc = 0;
+	sps.level_idc = 0;
+
 	byte Temp[MAXBLOCKSIZE];
 	//byte save_data[100];
 	memset(Temp,0, MAXBLOCKSIZE);
-	//memset(save_data, 0, 100);
 	ULONG Number = 1;
 	int remain = 0;
 	FILE* stream;
 	USES_CONVERSION;
+	//L"RookIE/1.0"
 	HINTERNET hSession = InternetOpen(L"RookIE/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
 	if (hSession != NULL)
 	{
@@ -815,10 +771,10 @@ void download(const char* Url, const char* save_as)	/*½«UrlÖ¸ÏòµÄµØÖ·µÄÎÄ¼şbaiÏÂ
 					memset(Temp + remain, 0, MAXBLOCKSIZE - remain);
 					InternetReadFile(handle2, Temp + remain, MAXBLOCKSIZE - 100, &Number);
 					Number += remain;
-					header sta=ps_parase(Temp,Number,remain);
+					Header sta= ps_parase(Temp,Number,remain);
 					if (sta == ps_packet_head_loading)
 					{
-						//»ù±¾ÉÏ²»¿ÉÄÜ²»Âú×ã
+						//åŸºæœ¬ä¸Šä¸å¯èƒ½ä¸æ»¡è¶³
 						if (remain <= 100)
 						{
 							for (int i = 0; i < remain; i++)
@@ -851,6 +807,11 @@ void download(const char* Url, const char* save_as)	/*½«UrlÖ¸ÏòµÄµØÖ·µÄÎÄ¼şbaiÏÂ
 }
 
 int main(int argc, char* argv[]) {
-	download("http://172.22.72.1:9580/test.ps", "c:\\q.ps");/*µ÷ÓÃÊ¾Àı£¬ÏÂÔØ°Ù¶ÈµÄÊ×Ò³µ½c:\index.htmlÎÄ¼ş*/
+	//http://172.22.72.1:9580/test.ps
+	thread t1(pushStream , "rtsp://localhost:554/tes", video_frame.buff_frame, video_frame.len);
+	download("http://172.22.172.1:9580/876221_13660360807_3ZWCA333447FELB.ps", "c:/q.ps");/*è°ƒç”¨ç¤ºä¾‹ï¼Œä¸‹è½½ç™¾åº¦çš„é¦–é¡µåˆ°c:\index.htmlæ–‡ä»¶*/
+	//pushStream("add1.h264","rtsp://localhost:554/t");
+	t1.join();
+	
 	return 0;
 }
